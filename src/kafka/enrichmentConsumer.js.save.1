@@ -1,0 +1,125 @@
+import "dotenv/config";
+import { kafka } from "./client.js";
+import { runOpenAIModeration } from "../services/openaiModeration.js";
+import { classifyWithOpus } from "../services/claudeOpus.js";
+import { runGPTOSS } from "../services/gptTier2.js";
+
+const INPUT_TOPIC = process.env.KAFKA_INPUT_TOPIC;
+const OUTPUT_TOPIC = process.env.KAFKA_OUTPUT_TOPIC;
+
+const consumer = kafka.consumer({
+  groupId: "fraud-enrichment-v1",
+});
+
+const producer = kafka.producer();
+
+// ----------------------------
+// Regex Tier
+// ----------------------------
+function regexBlock(text) {
+  if (!text) return false;
+  return [
+    /cvv/i,
+    /card\s*number/i,
+    /send\s*otp/i,
+    /verify\s*your\s*card/i,
+    /bank\s*details/i,
+  ].some((r) => r.test(text));
+}
+
+function cheapAllow(text) {
+  if (!text) return true;
+  if (text.length < 8) return true;
+  if (/^(hi|hello|ok|thanks)$/i.test(text.trim())) return true;
+  return false;
+}
+
+// ----------------------------
+// Start consumer
+// ----------------------------
+async function start() {
+  await producer.connect();
+  await consumer.connect();
+  await consumer.subscribe({ topic: INPUT_TOPIC, fromBeginning: true });
+
+  console.log("[Kafka] Enrichment consumer connected");
+
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      let payload;
+      try {
+        payload = JSON.parse(message.value.toString());
+      } catch {
+        return;
+      }
+      console.log("📥 RECEIVED EVENT:", payload);
+      const text = payload.text || "";
+      const audit = [];
+      let decision = "REVIEW";
+
+      // Tier 1
+      if (regexBlock(text)) {
+        decision = "BLOCK";
+        audit.push("regex");
+      }
+
+      // Tier 1.25
+      if (decision === "REVIEW" && cheapAllow(text)) {
+        decision = "ALLOW";
+        audit.push("cheap_allow");
+      }
+
+      // Tier 1.5
+      if (decision === "REVIEW") {
+        const mod = await runOpenAIModeration(text);
+        audit.push(`openai_${mod.decision}`);
+        if (mod.decision === "BLOCK") decision = "BLOCK";
+      }
+
+      // Tier 2
+      if (decision === "REVIEW") {
+        const opus = await classifyWithOpus(text);
+        audit.push(`opus_${opus}`);
+        if (opus !== "REVIEW") decision = opus;
+      }
+
+      // Tier 3
+      if (decision === "REVIEW") {
+        const gpt = await runGPTOSS({
+          text,
+          metadata: payload.metadata,
+          priorSignals: audit,
+        });
+        audit.push(`gpt_${gpt.decision}`);
+        decision = gpt.decision;
+      }
+      // decision has been finalized at this point
+console.log("✅ FINAL DECISION:", decision);
+
+await producer.send({
+  topic: OUTPUT_TOPIC,
+  messages: [{ value: JSON.stringify(enriched) }],
+});
+
+      await producer.send({
+        topic: OUTPUT_TOPIC,
+        messages: [
+          {
+            key: payload.id || null,
+            value: JSON.stringify({
+              ...payload,
+              decision,
+              audit,
+              enriched_at: new Date().toISOString(),
+            }),
+          },
+        ],
+      });
+    },
+  });
+}
+
+start().catch((err) => {
+  console.error("Consumer crashed", err);
+  process.exit(1);
+});

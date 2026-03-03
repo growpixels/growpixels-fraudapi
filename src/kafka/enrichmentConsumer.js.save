@@ -1,0 +1,162 @@
+import { kafka } from "./client.js";
+import { runOpenAIModeration } from "../services/openaiModeration.js";
+import { classifyWithOpus } from "../services/claudeOpus.js";
+import { runGPTOSS } from "../services/gptTier2.js";
+
+// ----------------------------
+// Config
+// ----------------------------
+const consumer = kafka.consumer({
+group Id: "fraud-enrichment-v1",
+});
+const INPUT_TOPIC = process.env.KAFKA_INPUT_TOPIC;
+const OUTPUT_TOPIC = process.env.KAFKA_OUTPUT_TOPIC;
+
+// ----------------------------
+// Regex / heuristics (Tier 1)
+// ----------------------------
+function regexBlock(text) {
+  if (!text) return false;
+
+  const patterns = [
+    /cvv/i,
+    /card\s*number/i,
+    /send\s*otp/i,
+    /verify\s*your\s*card/i,
+    /bank\s*details/i,
+    /wire\s*transfer/i,
+  ];
+
+  return patterns.some((p) => p.test(text));
+}
+
+// ----------------------------
+// Cheap allow rules (Tier 1.25)
+// ----------------------------
+function cheapAllow(text) {
+  if (!text) return true;
+  if (text.length < 8) return true;
+  if (/^(hi|hello|thanks|ok|yes|no)$/i.test(text.trim())) return true;
+  return false;
+}
+
+// ----------------------------
+// Main consumer
+// ----------------------------
+async function startConsumer() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: INPUT_TOPIC, fromBeginning: false });
+
+  console.log("[Kafka] Enrichment consumer connected");
+
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      const start = Date.now();
+
+      let payload;
+      try {
+        payload = JSON.parse(message.value.toString());
+      } catch {
+        return; // drop malformed messages
+      }
+
+      const text = payload.text || "";
+      const metadata = payload.metadata || {};
+
+      const audit = {
+        decisions: [],
+        escalations: [],
+      };
+
+      let finalDecision = "REVIEW";
+
+      // ----------------------------
+      // Tier 1 — Regex hard block
+      // ----------------------------
+      if (regexBlock(text)) {
+        finalDecision = "BLOCK";
+        audit.decisions.push("regex_block");
+      }
+
+      // ----------------------------
+      // Tier 1.25 — Cheap allow
+      // ----------------------------
+      if (finalDecision === "REVIEW" && cheapAllow(text)) {
+        finalDecision = "ALLOW";
+        audit.decisions.push("cheap_allow");
+      }
+
+      // ----------------------------
+      // Tier 1.5 — OpenAI Moderation
+      // ----------------------------
+      if (finalDecision === "REVIEW") {
+        const mod = await runOpenAIModeration(text);
+        audit.decisions.push(`openai_${mod.decision}`);
+
+        if (mod.decision === "BLOCK") {
+          finalDecision = "BLOCK";
+        }
+      }
+
+      // ----------------------------
+      // Tier 2 — Claude Opus (policy judge)
+      // ----------------------------
+      if (finalDecision === "REVIEW") {
+        const opusDecision = await classifyWithOpus(text);
+        audit.escalations.push("claude_opus");
+        audit.decisions.push(`opus_${opusDecision}`);
+
+        if (opusDecision !== "REVIEW") {
+          finalDecision = opusDecision;
+        }
+      }
+
+      // ----------------------------
+      // Tier 3 — GPT-OSS-120B (deep reasoning)
+      // ----------------------------
+      if (finalDecision === "REVIEW") {
+        const gpt = await runGPTOSS({
+          text,
+          metadata,
+          priorSignals: audit.decisions,
+        });
+
+        audit.escalations.push("gpt_oss_120b");
+        audit.decisions.push(`gpt_${gpt.decision}`);
+
+        finalDecision = gpt.decision;
+      }
+
+      // ----------------------------
+      // Emit enriched event
+      // ----------------------------
+      const enriched = {
+        ...payload,
+        decision: finalDecision,
+        audit,
+        latency_ms: Date.now() - start,
+        enriched_at: new Date().toISOString(),
+      };
+
+      await consumer.producer.send({
+        topic: OUTPUT_TOPIC,
+        messages: [
+          {
+            key: payload.id || null,
+            value: JSON.stringify(enriched),
+          },
+        ],
+      });
+    },
+  });
+}
+
+// ----------------------------
+startConsumer().catch((err) => {
+  console.error("[Kafka] Consumer crashed", err);
+  process.exit(1);
+});
+
+
+
+

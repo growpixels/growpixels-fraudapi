@@ -1,0 +1,15 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.log
+node_modules/
+.DS_Store
+synthetic_transactions.csv
+metabase/
+*.jar
+.env
+.env
+metabase/
+*.jar
+node_modules/

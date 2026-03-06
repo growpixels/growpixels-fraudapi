@@ -1,56 +1,51 @@
-import {
-  canCallGPT,
-  recordGPTCall,
-} from "./gptRateLimiter.js";
+import axios from "axios";
 
-/**
- * GPT-OSS-120B escalation tier
- * Last resort only
- */
-export async function runGPTOSS({ text, metadata, priorSignals }) {
-  // 🛑 Hard stop if limit reached
-  if (!canCallGPT()) {
-    return {
-      decision: "REVIEW",
-      reason: "gpt_daily_limit_reached",
-    };
+export async function runGptOss({ payload }) {
+  const endpoint = process.env.LLM_ENDPOINT;
+
+  if (!endpoint) {
+    throw new Error("LLM_ENDPOINT is missing");
   }
 
-  // 🛑 Proxy not configured
-  if (!global.gptOSSProxy || typeof global.gptOSSProxy.run !== "function") {
-    return {
-      decision: "REVIEW",
-      reason: "gpt_proxy_not_configured",
-    };
+  console.log("🚀 Calling Proxy Worker:", endpoint);
+
+  const response = await axios.post(
+    endpoint,
+    {
+      model: process.env.LLM_MODEL || "gpt-oss-120b",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a fraud detection engine. Respond ONLY in JSON: { \"score\": number between 0 and 100 }"
+        },
+        {
+          role: "user",
+          content: JSON.stringify(payload)
+        }
+      ],
+      stream: false,
+      max_tokens: 1000,
+      temperature: 0.2
+    },
+    {
+      headers: {
+        "Content-Type": "application/json"
+      },
+      timeout: 20000
+    }
+  );
+
+  const content = response.data?.choices?.[0]?.message?.content;
+
+  if (!content) {
+    throw new Error("Invalid LLM response structure");
   }
 
   try {
-    recordGPTCall();
-
-    const res = await global.gptOSSProxy.run({
-      text,
-      metadata,
-      signals: priorSignals,
-    });
-
-    // 🔒 Normalize response
-    return {
-      decision:
-        res?.decision === "ALLOW" ||
-        res?.decision === "BLOCK" ||
-        res?.decision === "REVIEW"
-          ? res.decision
-          : "REVIEW",
-      risk_score:
-        typeof res?.risk_score === "number" ? res.risk_score : null,
-      reason: "gpt_oss",
-    };
-  } catch (err) {
-    console.error("❌ GPT-OSS error:", err.message);
-
-    return {
-      decision: "REVIEW",
-      reason: "gpt_oss_error",
-    };
+    const parsed = JSON.parse(content);
+    return parsed;
+  } catch {
+    throw new Error("LLM returned non-JSON content");
   }
 }
